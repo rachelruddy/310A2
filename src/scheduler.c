@@ -13,6 +13,9 @@ static int next_pid = 1;
 static PCB *ready_head = NULL;
 static PCB *ready_tail = NULL;
 
+//instructions to execute as timer for RR
+static const int max_instr = 2;
+
 
 //enqueue a PCB to tail of queue
 void enqueue(PCB *pcb){
@@ -67,7 +70,30 @@ void run_scheduler(const char *policy){
 
     //RR and AGING implementations
     else{
-        //TODO
+        while ((pcb = dequeue()) != NULL) {
+            //execute 2 instructions of a given pcb at a time
+            int done = 0;
+            for (int i = 0; i<max_instr; i++){
+                if(pcb->pc < pcb->code_len){
+                    const char *line = program_get_line(pcb->code_start + pcb->pc);
+                    if (line) {
+                        (void)parseInput((char *)line);
+                    }
+                    pcb->pc++;
+                }
+                else{
+                    program_free(pcb->code_start, pcb->code_len);
+                    free(pcb);
+                    done = 1;
+                    break;
+                }
+            }
+
+            //enqueue the pcb back to tail of queue if prgrm not done
+            if(done == 0){
+                enqueue(pcb);
+            }
+        }
     }
 
     //reset PIDs
