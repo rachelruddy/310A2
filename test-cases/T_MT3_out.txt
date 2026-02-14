@@ -1,0 +1,4 @@
+Shell version 1.5 created Dec 2025
+Unknown Command
+Invalid POLICY. Please input one of: FCFS, SJF, RR, AGING as your last argument. 
+Bye!

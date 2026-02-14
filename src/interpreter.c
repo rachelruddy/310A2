@@ -22,56 +22,7 @@
 
 #include "shellmemory.h"
 #include "shell.h"
-
-typedef struct PCB {
-    int pid;
-    int code_start;
-    int code_len;
-    int pc;
-    struct PCB *next;
-} PCB;
-
-static PCB *ready_head = NULL;
-static PCB *ready_tail = NULL;
-static int next_pid = 1;
-
-static void enqueue_pcb(PCB *pcb) {
-    if (!ready_tail) {
-        ready_head = pcb;
-        ready_tail = pcb;
-        return;
-    }
-    ready_tail->next = pcb;
-    ready_tail = pcb;
-}
-
-static PCB *dequeue_pcb(void) {
-    if (!ready_head) {
-        return NULL;
-    }
-    PCB *pcb = ready_head;
-    ready_head = ready_head->next;
-    if (!ready_head) {
-        ready_tail = NULL;
-    }
-    pcb->next = NULL;
-    return pcb;
-}
-
-static void run_scheduler_fcfs(void) {
-    PCB *pcb = NULL;
-    while ((pcb = dequeue_pcb()) != NULL) {
-        while (pcb->pc < pcb->code_len) {
-            const char *line = program_get_line(pcb->code_start + pcb->pc);
-            if (line) {
-                (void)parseInput((char *)line);
-            }
-            pcb->pc++;
-        }
-        program_free(pcb->code_start, pcb->code_len);
-        free(pcb);
-    }
-}
+#include "scheduler.h"
 
 int badcommand() {
     printf("Unknown Command\n");
@@ -106,6 +57,7 @@ int cd(char *path);
 int source(char *script);
 int run(char *args[], int args_size);
 int badcommandFileDoesNotExist();
+int exec(char *args[], int args_size);
 
 // Interpret commands and their arguments
 int interpreter(char *command_args[], int args_size) {
@@ -187,8 +139,13 @@ int interpreter(char *command_args[], int args_size) {
         if (args_size < 2)
             return badcommand();
         return run(&command_args[1], args_size - 1);
-
-    } else
+    } 
+    else if (strcmp(command_args[0], "exec") == 0){
+        if (args_size > 5 || args_size < 3)
+            return badcommand();
+        return exec(&command_args[1], (args_size-1));
+    }
+    else
         return badcommand();
 }
 
@@ -429,14 +386,14 @@ int source(char *script) {
         return 1;
     }
 
-    pcb->pid = next_pid++;
+    pcb->pid = get_next_pid();
     pcb->code_start = code_start;
     pcb->code_len = code_len;
     pcb->pc = 0;
     pcb->next = NULL;
 
-    enqueue_pcb(pcb);
-    run_scheduler_fcfs();
+    enqueue(pcb);
+    run_scheduler("FCFS");
 
     return 0;
 }
@@ -475,5 +432,69 @@ int run(char *args[], int arg_size) {
         waitpid(pid, NULL, 0);
     }
 
+    return 0;
+}
+
+int exec(char *args[], int args_size){
+    int errCode = 0;
+
+    //get the last parameter (policy name)
+    char *policy = args[args_size-1]; 
+    if (strcmp(policy, "FCFS") != 0 && strcmp(policy, "SJF") != 0 && strcmp(policy, "FCFS") != 0 && strcmp(policy, "RR") != 0 && strcmp(policy, "AGING") != 0){
+        printf("Invalid POLICY. Please input one of: FCFS, SJF, RR, AGING as your last argument. \n");
+        return 1;
+    }
+    int num_programs = args_size - 1;
+
+    //check if each program file exists
+    for(int i=0; i<num_programs; i++){
+        FILE *p = fopen(args[i], "rt");      
+        if (p == NULL) { 
+            printf("Program file '%s' not found.\n", args[i]);
+            return badcommandFileDoesNotExist();
+        }
+        fclose(p);
+    }
+
+    // check for duplicate program filenames
+    for(int i = 0; i < num_programs; i++){
+        for(int j = i + 1; j < num_programs; j++){
+            if (strcmp(args[i], args[j]) == 0){
+                printf("Error: Each program must be different.\n");
+                return 1; 
+            }
+        }
+    }
+
+    //////////////// FCFS enqueuing ////////////////////
+    //load programs and enqueue PCBs
+    for (int i=0; i<num_programs; i++){
+        FILE *p = fopen(args[i], "rt"); 
+
+        int code_start = 0;
+        int code_len = 0;
+        int load_rc = program_store_script(p, &code_start, &code_len);
+        fclose(p);
+
+        if (load_rc != 0) {
+            printf("Error: Script memory full\n");
+            return 1;
+        }
+
+        PCB *pcb = malloc(sizeof(PCB));
+        if (!pcb) {
+            program_free(code_start, code_len);
+            return 1;
+        }
+
+        pcb->pid = get_next_pid();
+        pcb->code_start = code_start;
+        pcb->code_len = code_len;
+        pcb->pc = 0;
+        pcb->next = NULL;
+
+        enqueue(pcb);
+    }
+    run_scheduler(policy);
     return 0;
 }

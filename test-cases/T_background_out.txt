@@ -1,0 +1,6 @@
+Shell version 1.5 created Dec 2025
+Invalid POLICY. Please input one of: FCFS, SJF, RR, AGING as your last argument. 
+shell
+shell
+quit
+Bye!
