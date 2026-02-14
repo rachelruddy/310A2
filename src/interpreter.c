@@ -23,6 +23,56 @@
 #include "shellmemory.h"
 #include "shell.h"
 
+typedef struct PCB {
+    int pid;
+    int code_start;
+    int code_len;
+    int pc;
+    struct PCB *next;
+} PCB;
+
+static PCB *ready_head = NULL;
+static PCB *ready_tail = NULL;
+static int next_pid = 1;
+
+static void enqueue_pcb(PCB *pcb) {
+    if (!ready_tail) {
+        ready_head = pcb;
+        ready_tail = pcb;
+        return;
+    }
+    ready_tail->next = pcb;
+    ready_tail = pcb;
+}
+
+static PCB *dequeue_pcb(void) {
+    if (!ready_head) {
+        return NULL;
+    }
+    PCB *pcb = ready_head;
+    ready_head = ready_head->next;
+    if (!ready_head) {
+        ready_tail = NULL;
+    }
+    pcb->next = NULL;
+    return pcb;
+}
+
+static void run_scheduler_fcfs(void) {
+    PCB *pcb = NULL;
+    while ((pcb = dequeue_pcb()) != NULL) {
+        while (pcb->pc < pcb->code_len) {
+            const char *line = program_get_line(pcb->code_start + pcb->pc);
+            if (line) {
+                (void)parseInput((char *)line);
+            }
+            pcb->pc++;
+        }
+        program_free(pcb->code_start, pcb->code_len);
+        free(pcb);
+    }
+}
+
 int badcommand() {
     printf("Unknown Command\n");
     return 1;
@@ -359,24 +409,36 @@ int source(char *script) {
     char line[MAX_USER_INPUT];
     FILE *p = fopen(script, "rt");      // the program is in a file
 
-    if (p == NULL) {
+    if (p == NULL) { // soruce changed
         return badcommandFileDoesNotExist();
     }
 
-    fgets(line, MAX_USER_INPUT - 1, p);
-    while (1) {
-        errCode = parseInput(line);     // which calls interpreter()
-        memset(line, 0, sizeof(line));
-
-        if (feof(p)) {
-            break;
-        }
-        fgets(line, MAX_USER_INPUT - 1, p);
-    }
-
+    int code_start = 0;
+    int code_len = 0;
+    int load_rc = program_store_script(p, &code_start, &code_len);
     fclose(p);
 
-    return errCode;
+    if (load_rc != 0) {
+        printf("Error: Script memory full\n");
+        return 1;
+    }
+
+    PCB *pcb = malloc(sizeof(PCB));
+    if (!pcb) {
+        program_free(code_start, code_len);
+        return 1;
+    }
+
+    pcb->pid = next_pid++;
+    pcb->code_start = code_start;
+    pcb->code_len = code_len;
+    pcb->pc = 0;
+    pcb->next = NULL;
+
+    enqueue_pcb(pcb);
+    run_scheduler_fcfs();
+
+    return 0;
 }
 
 int run(char *args[], int arg_size) {
