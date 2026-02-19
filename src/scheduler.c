@@ -16,6 +16,45 @@ static PCB *ready_tail = NULL;
 //instructions to execute as timer for RR
 static const int max_instr = 2;
 
+//enqueue a PCB into ready queue ordered by score (ascending)
+static void enqueue_by_score(PCB *pcb){
+    pcb->next = NULL;
+
+    if (!ready_head) {
+        ready_head = pcb;
+        ready_tail = pcb;
+        return;
+    }
+
+    if (pcb->score <= ready_head->score) {
+        pcb->next = ready_head;
+        ready_head = pcb;
+        return;
+    }
+
+    PCB *cur = ready_head;
+    while (cur->next && cur->next->score < pcb->score) {
+        cur = cur->next;
+    }
+
+    pcb->next = cur->next;
+    cur->next = pcb;
+    if (!pcb->next) {
+        ready_tail = pcb;
+    }
+}
+
+//decrease score of all waiting processes by 1 (minimum 0)
+static void age_ready_queue(void){
+    PCB *cur = ready_head;
+    while (cur) {
+        if (cur->score > 0) {
+            cur->score--;
+        }
+        cur = cur->next;
+    }
+}
+
 
 //enqueue a PCB to tail of queue
 void enqueue(PCB *pcb){
@@ -67,8 +106,25 @@ void run_scheduler(const char *policy){
             free(pcb);
         }
     }
+    else if (strcmp(policy, "AGING") == 0){
+        while ((pcb = dequeue()) != NULL) {
+            const char *line = program_get_line(pcb->code_start + pcb->pc);
+            if (line) {
+                (void)parseInput((char *)line);
+            }
+            pcb->pc++;
 
-    //RR and AGING implementations
+            age_ready_queue();
+
+            if (pcb->pc >= pcb->code_len) {
+                program_free(pcb->code_start, pcb->code_len);
+                free(pcb);
+            } else {
+                enqueue_by_score(pcb);
+            }
+        }
+    }
+    //RR implementatino
     else{
         while ((pcb = dequeue()) != NULL) {
             //execute 2 instructions of a given pcb at a time

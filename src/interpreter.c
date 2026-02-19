@@ -542,12 +542,63 @@ int exec(char *args[], int args_size){
             }
         }
 
-        //enqueue programs based on this sorting
+	//enqueue programs based on this sorting
         for (int i = 0; i < num_programs; i++) {
             enqueue(pcb_list[i]);
         }
     }
-    
+
+    //////////// AGING - 1.2.4 ASH ////////////
+    else if (strcmp(policy, "AGING")==0) {
+        //sort programs by length- shortest program first -> longest last
+        PCB *pcb_list[num_programs];
+
+        for (int i = 0; i < num_programs; i++) {
+            FILE *p = fopen(args[i], "rt");
+
+            int code_start = 0;
+            int code_len = 0;
+            int load_rc = program_store_script(p, &code_start, &code_len);
+            fclose(p);
+
+            if (load_rc != 0) {
+                printf("Error: Script memory full\n");
+                return 1;
+            }
+
+            PCB *pcb = malloc(sizeof(PCB));
+            if (!pcb) {
+                program_free(code_start, code_len);
+                return 1;
+            }
+
+            pcb->pid = get_next_pid();
+            pcb->code_start = code_start;
+            pcb->code_len = code_len;
+            pcb->pc = 0;
+            pcb->score= pcb->code_len; // initialize score to code length
+            pcb->next = NULL;
+
+            pcb_list[i] = pcb;   // store temporarily
+        }
+
+        //sort by score this time
+        for (int i = 0; i < num_programs - 1; i++) {
+            for (int j = 0; j < num_programs - i - 1; j++) {
+                if (pcb_list[j]->code_len > pcb_list[j + 1]->code_len) {
+                    PCB *temp = pcb_list[j];
+                    pcb_list[j] = pcb_list[j + 1];
+                    pcb_list[j + 1] = temp;
+                }
+            }
+        }
+
+	//enqueue programs based on this sorting
+        for (int i = 0; i < num_programs; i++) {
+            enqueue(pcb_list[i]);
+        }
+    }
+      
     run_scheduler(policy);
     return 0;
 }

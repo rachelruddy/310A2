@@ -3,11 +3,12 @@
 
 // Define PCB struct
 typedef struct PCB {
-    int pid;
-    int code_start;
-    int code_len;
-    int pc;
-    struct PCB *next;
+  int pid;
+  int code_start;
+  int code_len;
+  int pc;
+  int score;
+  struct PCB *next;
 } PCB;
 
 //enqueue/dequeue pcb
