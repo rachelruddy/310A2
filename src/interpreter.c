@@ -56,8 +56,9 @@ int touch(char *path);
 int cd(char *path);
 int source(char *script);
 int run(char *args[], int args_size);
-int badcommandFileDoesNotExist();
 int exec(char *args[], int args_size);
+
+static int enqueue_batch_script_process(void);
 
 // Interpret commands and their arguments
 int interpreter(char *command_args[], int args_size) {
@@ -141,7 +142,7 @@ int interpreter(char *command_args[], int args_size) {
         return run(&command_args[1], args_size - 1);
     } 
     else if (strcmp(command_args[0], "exec") == 0){
-        if (args_size > 5 || args_size < 3)
+        if (args_size < 3 || args_size > 7)
             return badcommand();
         return exec(&command_args[1], (args_size-1));
     }
@@ -164,7 +165,56 @@ source SCRIPT.TXT		Executes the file SCRIPT.TXT\n ";
 
 int quit() {
     printf("Bye!\n");
+
+    if (scheduler_mt_is_enabled()) {
+        scheduler_mt_request_quit();
+        if (!scheduler_mt_is_worker_thread()) {
+            scheduler_mt_shutdown();
+            exit(0);
+        }
+        return 0;
+    }
     exit(0);
+}
+
+static int enqueue_batch_script_process(void) {
+    char line[MAX_USER_INPUT];
+    FILE *tmp = tmpfile();
+    if (!tmp) {
+        return 1;
+    }
+
+    while (fgets(line, MAX_USER_INPUT - 1, stdin) != NULL) {
+        fputs(line, tmp);
+    }
+
+    rewind(tmp);
+
+    int code_start = 0;
+    int code_len = 0;
+    int load_rc = program_store_script(tmp, &code_start, &code_len);
+    fclose(tmp);
+
+    if (load_rc != 0) {
+        printf("Error: Script memory full\n");
+        return 1;
+    }
+
+    PCB *pcb = malloc(sizeof(PCB));
+    if (!pcb) {
+        program_free(code_start, code_len);
+        return 1;
+    }
+
+    pcb->pid = get_next_pid();
+    pcb->code_start = code_start;
+    pcb->code_len = code_len;
+    pcb->pc = 0;
+    pcb->score = pcb->code_len;
+    pcb->next = NULL;
+
+    enqueue_front(pcb);
+    return 0;
 }
 
 int set(char *var, char *value) {
@@ -346,24 +396,12 @@ int cd(char *path) {
 
     int result = chdir(path);
     if (result) {
-        // chdir can fail for several reasons, but the only one we need
-        // to handle here for the spec is the ENOENT reason,
-        // aka Error NO ENTry -- the directory doesn't exist.
-        // Since that's the only one we have to handle, we'll just assume
-        // that that's what happened.
-        // Alternatively, you can check if the directory exists
-        // explicitly first using `stat`. However it is often better to
-        // simply try to use a filesystem resource and then recover when
-        // you can't, rather than trying to validate first. If you validate
-        // first while two users are on the system, there's a race condition!
         return badcommandCd();
     }
     return 0;
 }
 
 int source(char *script) {
-    int errCode = 0;
-    char line[MAX_USER_INPUT];
     FILE *p = fopen(script, "rt");      // the program is in a file
 
     if (p == NULL) { // soruce changed
@@ -417,14 +455,7 @@ int run(char *args[], int arg_size) {
         // we are the new child process.
         execvp(adj_args[0], adj_args);
         perror("exec failed");
-        // The parent and child are sharing stdin, and according to
-        // a part of the glibc documentation that you are **not**
-        // expected to know for this course, a shared input handle
-        // should be fflushed (if it is needed) or closed
-        // (if it is not). Handling this exec error case is not even
-        // necessary, but let's do it right.
-        // (Failure to do this can result in the parent process
-        // reading the remaining input twice in batch mode.)
+        // avoid duplicated stdin reads in some batch-mode failure cases
         fclose(stdin);
         exit(1);
     } else {
@@ -435,16 +466,48 @@ int run(char *args[], int arg_size) {
     return 0;
 }
 
-int exec(char *args[], int args_size){
+int exec(char *args[], int args_size) {
     int errCode = 0;
+    int mt_flag = 0;
+    int bg_flag = 0;
+
+    int end = args_size - 1;
+    if (end >= 0 && strcmp(args[end], "MT") == 0) {
+        mt_flag = 1;
+        end--;
+    }
+    if (end >= 0 && strcmp(args[end], "#") == 0) {
+        bg_flag = 1;
+        end--;
+    }
+    if (end < 1) {
+        return badcommand();
+    }
 
     //get the last parameter (policy name)
-    char *policy = args[args_size-1]; 
-    if (strcmp(policy, "FCFS") != 0 && strcmp(policy, "SJF") != 0 && strcmp(policy, "FCFS") != 0 && strcmp(policy, "RR") != 0 && strcmp(policy, "AGING") != 0){
-        printf("Invalid POLICY. Please input one of: FCFS, SJF, RR, AGING as your last argument. \n");
+    char *policy = args[end];
+    if (strcmp(policy, "FCFS") != 0 && strcmp(policy, "SJF") != 0 && strcmp(policy, "RR") != 0 && strcmp(policy, "RR30") != 0 && strcmp(policy, "AGING") != 0){
+        printf("Invalid POLICY. Please input one of: FCFS, SJF, RR, RR30, AGING as your last argument. \n");
         return 1;
     }
-    int num_programs = args_size - 1;
+
+    if (mt_flag) {
+        if (!scheduler_policy_supports_mt(policy)) {
+            printf("MT option only supported with RR or RR30.\n");
+            return 1;
+        }
+
+        if (!scheduler_mt_is_enabled() && scheduler_mt_enable() != 0) {
+            printf("Failed to initialize MT scheduler worker threads.\n");
+            return 1;
+        }
+    }
+
+    int num_programs = end;
+
+    if (num_programs < 1 || num_programs > 3) {
+        return badcommand();
+    }
 
     //check if each program file exists
     for(int i=0; i<num_programs; i++){
@@ -454,6 +517,13 @@ int exec(char *args[], int args_size){
             return badcommandFileDoesNotExist();
         }
         fclose(p);
+    }
+
+    if (bg_flag) {
+        errCode = enqueue_batch_script_process();
+        if (errCode != 0) {
+            return errCode;
+        }
     }
 
     // check for duplicate program filenames
@@ -467,7 +537,7 @@ int exec(char *args[], int args_size){
     }
 
     //////////////// FCFS and RR enqueuing ////////////////////
-    if(strcmp(policy, "FCFS") == 0 || strcmp(policy, "RR") == 0){
+    if(strcmp(policy, "FCFS") == 0 || strcmp(policy, "RR") == 0 || strcmp(policy, "RR30") == 0){
         //load programs and enqueue PCBs
         for (int i=0; i<num_programs; i++){
             FILE *p = fopen(args[i], "rt"); 
@@ -585,7 +655,7 @@ int exec(char *args[], int args_size){
         //sort by score this time
         for (int i = 0; i < num_programs - 1; i++) {
             for (int j = 0; j < num_programs - i - 1; j++) {
-                if (pcb_list[j]->code_len > pcb_list[j + 1]->code_len) {
+                if (pcb_list[j]->score > pcb_list[j + 1]->score) {
                     PCB *temp = pcb_list[j];
                     pcb_list[j] = pcb_list[j + 1];
                     pcb_list[j + 1] = temp;
@@ -602,3 +672,4 @@ int exec(char *args[], int args_size){
     run_scheduler(policy);
     return 0;
 }
+

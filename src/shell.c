@@ -6,6 +6,7 @@
 #include "shell.h"
 #include "interpreter.h"
 #include "shellmemory.h"
+#include "scheduler.h"
 
 int parseInput(char ui[]);
 
@@ -32,12 +33,20 @@ int main(int argc, char *argv[]) {
         }
         // here you should check the unistd library 
         // so that you can find a way to not display $ in the batch mode
-        fgets(userInput, MAX_USER_INPUT - 1, stdin);
+        if (fgets(userInput, MAX_USER_INPUT - 1, stdin) == NULL) {
+            if (feof(stdin) && scheduler_mt_is_enabled()) {
+                scheduler_mt_shutdown();
+            }
+            return 0;
+        }
         errorCode = parseInput(userInput);
         if (errorCode == -1)
             exit(99);           // ignore all other errors
 
         if (feof(stdin)) {
+            if (scheduler_mt_is_enabled()) {
+                scheduler_mt_shutdown();
+            }
             return 0;
         }
 
@@ -50,7 +59,7 @@ int main(int argc, char *argv[]) {
 int wordEnding(char c) {
     // You may want to add ';' to this at some point,
     // or you may want to find a different way to implement chains.
-    return c == '\0' || c == '\n' || isspace(c) || c == ';';
+    return c == '\0' || c == '\n' || isspace(c) || c == ';' || c == '`';
 }
 
 int parseInput(char inp[]) {
@@ -70,7 +79,7 @@ int parseInput(char inp[]) {
 
     while (inp[ix] != '\n' && inp[ix] != '\0' && ix < 1000) {
         // skip white spaces
-        for (; isspace(inp[ix]) && inp[ix] != '\n' && ix < 1000; ix++);
+        for (; (isspace(inp[ix]) || inp[ix] == '`') && inp[ix] != '\n' && ix < 1000; ix++);
 
         // If the next character is a semicolon,
         // we should run what we have so far.

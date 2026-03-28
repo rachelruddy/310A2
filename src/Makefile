@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=
+CFLAGS=-pthread
 FMT=indent
 
 mysh: shell.c interpreter.c shellmemory.c scheduler.c

@@ -5,6 +5,7 @@
 #include "interpreter.h"
 #include "shell.h"
 #include <string.h>
+#include <pthread.h>
 
 //next pid counter
 static int next_pid = 1;
@@ -15,6 +16,232 @@ static PCB *ready_tail = NULL;
 
 //instructions to execute as timer for RR
 static const int max_instr = 2;
+
+// ---------------- MT scheduler skeleton ----------------
+static const int mt_worker_count = 2;
+static pthread_t mt_workers[2];
+static pthread_mutex_t mt_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t mt_cv = PTHREAD_COND_INITIALIZER;
+static int mt_enabled = 0;
+static int mt_shutdown = 0;
+static int mt_running = 0;
+static int mt_active_workers = 0;
+static int mt_quantum = 2;
+static int mt_quit_requested = 0;
+
+static int rr_quantum_for_policy(const char *policy) {
+    if (strcmp(policy, "RR30") == 0) {
+        return 30;
+    }
+    return max_instr;
+}
+
+static void enqueue_nolock(PCB *pcb) {
+    pcb->next = NULL;
+    if (!ready_tail) {
+        ready_head = pcb;
+        ready_tail = pcb;
+        return;
+    }
+    ready_tail->next = pcb;
+    ready_tail = pcb;
+}
+
+static void enqueue_front_nolock(PCB *pcb) {
+    if (!ready_head) {
+        pcb->next = NULL;
+        ready_head = pcb;
+        ready_tail = pcb;
+        return;
+    }
+
+    pcb->next = ready_head;
+    ready_head = pcb;
+}
+
+static PCB *dequeue_nolock(void) {
+    if (!ready_head) {
+        return NULL;
+    }
+    PCB *pcb = ready_head;
+    ready_head = ready_head->next;
+    if (!ready_head) {
+        ready_tail = NULL;
+    }
+    pcb->next = NULL;
+    return pcb;
+}
+
+static void *mt_worker_main(void *arg) {
+    (void)arg;
+
+    pthread_mutex_lock(&mt_lock);
+    while (!mt_shutdown) {
+        while (!mt_shutdown && (!mt_running || !ready_head)) {
+            pthread_cond_wait(&mt_cv, &mt_lock);
+        }
+
+        if (mt_shutdown) {
+            break;
+        }
+
+        PCB *pcb = dequeue_nolock();
+        if (!pcb) {
+            continue;
+        }
+        mt_active_workers++;
+        int quantum = mt_quantum;
+        pthread_mutex_unlock(&mt_lock);
+
+        int done = 0;
+        for (int i = 0; i < quantum; i++) {
+            if (pcb->pc < pcb->code_len) {
+                const char *line = program_get_line(pcb->code_start + pcb->pc);
+                if (line) {
+                    (void)parseInput((char *)line);
+                }
+                pcb->pc++;
+            } else {
+                done = 1;
+                break;
+            }
+        }
+
+        if (pcb->pc >= pcb->code_len) {
+            done = 1;
+        }
+
+        pthread_mutex_lock(&mt_lock);
+        mt_active_workers--;
+
+        if (done) {
+            program_free(pcb->code_start, pcb->code_len);
+            free(pcb);
+        } else {
+            enqueue_nolock(pcb);
+            pthread_cond_broadcast(&mt_cv);
+        }
+
+        if (mt_quit_requested && !ready_head && mt_active_workers == 0) {
+            mt_shutdown = 1;
+            pthread_cond_broadcast(&mt_cv);
+        }
+
+        if (mt_running && !ready_head && mt_active_workers == 0) {
+            pthread_cond_broadcast(&mt_cv);
+        }
+    }
+    pthread_mutex_unlock(&mt_lock);
+
+    return NULL;
+}
+
+int scheduler_policy_supports_mt(const char *policy) {
+    return (strcmp(policy, "RR") == 0 || strcmp(policy, "RR30") == 0);
+}
+
+int scheduler_mt_enable(void) {
+    pthread_mutex_lock(&mt_lock);
+    if (mt_enabled) {
+        pthread_mutex_unlock(&mt_lock);
+        return 0;
+    }
+
+    mt_shutdown = 0;
+    mt_quit_requested = 0;
+    pthread_mutex_unlock(&mt_lock);
+
+    for (int i = 0; i < mt_worker_count; i++) {
+        if (pthread_create(&mt_workers[i], NULL, mt_worker_main, NULL) != 0) {
+            pthread_mutex_lock(&mt_lock);
+            mt_shutdown = 1;
+            pthread_cond_broadcast(&mt_cv);
+            pthread_mutex_unlock(&mt_lock);
+
+            for (int j = 0; j < i; j++) {
+                pthread_join(mt_workers[j], NULL);
+            }
+            return 1;
+        }
+    }
+
+    pthread_mutex_lock(&mt_lock);
+    mt_enabled = 1;
+    pthread_mutex_unlock(&mt_lock);
+    return 0;
+}
+
+void scheduler_mt_shutdown(void) {
+    pthread_t self = pthread_self();
+
+    pthread_mutex_lock(&mt_lock);
+    if (!mt_enabled) {
+        pthread_mutex_unlock(&mt_lock);
+        return;
+    }
+
+    mt_quit_requested = 1;
+    while (ready_head || mt_active_workers > 0) {
+        pthread_cond_wait(&mt_cv, &mt_lock);
+    }
+
+    mt_shutdown = 1;
+    pthread_cond_broadcast(&mt_cv);
+    pthread_mutex_unlock(&mt_lock);
+
+    for (int i = 0; i < mt_worker_count; i++) {
+        if (pthread_equal(mt_workers[i], self)) {
+            continue;
+        }
+        pthread_join(mt_workers[i], NULL);
+    }
+
+    pthread_mutex_lock(&mt_lock);
+    mt_enabled = 0;
+    mt_running = 0;
+    mt_shutdown = 0;
+    mt_active_workers = 0;
+    mt_quit_requested = 0;
+    pthread_mutex_unlock(&mt_lock);
+}
+
+int scheduler_mt_is_enabled(void) {
+    pthread_mutex_lock(&mt_lock);
+    int enabled = mt_enabled;
+    pthread_mutex_unlock(&mt_lock);
+    return enabled;
+}
+
+void scheduler_mt_request_quit(void) {
+    pthread_mutex_lock(&mt_lock);
+    if (mt_enabled) {
+        mt_quit_requested = 1;
+        if (!ready_head && mt_active_workers == 0) {
+            mt_shutdown = 1;
+        }
+        pthread_cond_broadcast(&mt_cv);
+    }
+    pthread_mutex_unlock(&mt_lock);
+}
+
+int scheduler_mt_is_worker_thread(void) {
+    pthread_t self = pthread_self();
+    int is_worker = 0;
+
+    pthread_mutex_lock(&mt_lock);
+    if (mt_enabled) {
+        for (int i = 0; i < mt_worker_count; i++) {
+            if (pthread_equal(mt_workers[i], self)) {
+                is_worker = 1;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&mt_lock);
+
+    return is_worker;
+}
+// -------------- end MT scheduler skeleton --------------
 
 //enqueue a PCB into ready queue ordered by score (ascending)
 static void enqueue_by_score(PCB *pcb){
@@ -58,28 +285,24 @@ static void age_ready_queue(void){
 
 //enqueue a PCB to tail of queue
 void enqueue(PCB *pcb){
-    //set next pcb in queue after tail to null
-    pcb->next = NULL;
-    if (!ready_tail) {
-        ready_head = pcb;
-        ready_tail = pcb;
-        return;
-    }
-    ready_tail->next = pcb;
-    ready_tail = pcb;
+    pthread_mutex_lock(&mt_lock);
+    enqueue_nolock(pcb);
+    pthread_cond_broadcast(&mt_cv);
+    pthread_mutex_unlock(&mt_lock);
+}
+
+void enqueue_front(PCB *pcb) {
+    pthread_mutex_lock(&mt_lock);
+    enqueue_front_nolock(pcb);
+    pthread_cond_broadcast(&mt_cv);
+    pthread_mutex_unlock(&mt_lock);
 }
 
 //dequeue a PCB from head of queue
 PCB* dequeue(void){
-    if (!ready_head) {
-        return NULL;
-    }
-    PCB *pcb = ready_head;
-    ready_head = ready_head->next;
-    if (!ready_head) {
-        ready_tail = NULL;
-    }
-    pcb->next = NULL;
+    pthread_mutex_lock(&mt_lock);
+    PCB *pcb = dequeue_nolock();
+    pthread_mutex_unlock(&mt_lock);
     return pcb;
 }
 
@@ -91,6 +314,15 @@ int get_next_pid(void){
 //run the scheduler
 void run_scheduler(const char *policy){
     PCB *pcb = NULL;
+
+    if (mt_enabled && scheduler_policy_supports_mt(policy)) {
+        pthread_mutex_lock(&mt_lock);
+        mt_quantum = rr_quantum_for_policy(policy);
+        mt_running = 1;
+        pthread_cond_broadcast(&mt_cv);
+        pthread_mutex_unlock(&mt_lock);
+        return;
+    }
 
     //FCFS and SJF implementation
     if(strcmp(policy, "FCFS") == 0 || strcmp(policy, "SJF") == 0){
@@ -124,12 +356,13 @@ void run_scheduler(const char *policy){
             }
         }
     }
-    //RR implementatino
+    //RR and RR30 implementation
     else{
+        int quantum = rr_quantum_for_policy(policy);
         while ((pcb = dequeue()) != NULL) {
-            //execute 2 instructions of a given pcb at a time
+            //execute one policy quantum at a time
             int done = 0;
-            for (int i = 0; i<max_instr; i++){
+            for (int i = 0; i < quantum; i++){
                 if(pcb->pc < pcb->code_len){
                     const char *line = program_get_line(pcb->code_start + pcb->pc);
                     if (line) {
