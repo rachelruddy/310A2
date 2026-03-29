@@ -192,7 +192,13 @@ static int enqueue_batch_script_process(void) {
 
     int code_start = 0;
     int code_len = 0;
-    int load_rc = program_store_script(tmp, &code_start, &code_len);
+
+    // create a temporary Program object for this batch script
+    Program batch_program;
+    batch_program.count = 0;  // no PCBs yet
+
+
+    int load_rc = program_store_script(tmp, &code_start, &code_len, &batch_program);
     fclose(tmp);
 
     if (load_rc != 0) {
@@ -200,9 +206,12 @@ static int enqueue_batch_script_process(void) {
         return 1;
     }
 
+    batch_program.code_start = code_start;
+    batch_program.code_len = code_len;
+
     PCB *pcb = malloc(sizeof(PCB));
     if (!pcb) {
-        program_free(code_start, code_len);
+        program_free(&batch_program);
         return 1;
     }
 
@@ -212,8 +221,22 @@ static int enqueue_batch_script_process(void) {
     pcb->pc = 0;
     pcb->score = pcb->code_len;
     pcb->next = NULL;
+    pcb->program = &batch_program;
+    //Assignment 3: page table logic
+    pcb->num_pages = batch_program.num_pages;
+    for (int i = 0; i < MAX_PAGES; i++) {
+        if (i < batch_program.num_pages) {
+            pcb->page_table[i] = batch_program.frames[i]; // copy frame number
+        } else {
+            pcb->page_table[i] = -1; // unused pages
+        }
+    }
 
     enqueue_front(pcb);
+
+    // increment count now that PCB points to program
+    batch_program.count = 1;
+
     return 0;
 }
 
@@ -410,7 +433,12 @@ int source(char *script) {
 
     int code_start = 0;
     int code_len = 0;
-    int load_rc = program_store_script(p, &code_start, &code_len);
+
+    //create program object for script
+    Program source_program;
+    source_program.count = 0;       //no pcbs assigned yet
+
+    int load_rc = program_store_script(p, &code_start, &code_len, &source_program);
     fclose(p);
 
     if (load_rc != 0) {
@@ -418,9 +446,12 @@ int source(char *script) {
         return 1;
     }
 
+    source_program.code_start = code_start;
+    source_program.code_len = code_len;
+
     PCB *pcb = malloc(sizeof(PCB));
     if (!pcb) {
-        program_free(code_start, code_len);
+        program_free(&source_program);
         return 1;
     }
 
@@ -429,8 +460,22 @@ int source(char *script) {
     pcb->code_len = code_len;
     pcb->pc = 0;
     pcb->next = NULL;
+    pcb->program = &source_program;
+    //Assignment 3: page table logic
+    pcb->num_pages = source_program.num_pages;
+    for (int i = 0; i < MAX_PAGES; i++) {
+        if (i < source_program.num_pages) {
+            pcb->page_table[i] = source_program.frames[i]; // copy frame number
+        } else {
+            pcb->page_table[i] = -1; // unused pages
+        }
+    }
 
     enqueue(pcb);
+
+    // increment count now that PCB points to program
+    source_program.count = 1;
+
     run_scheduler("FCFS");
 
     return 0;
@@ -526,45 +571,89 @@ int exec(char *args[], int args_size) {
         }
     }
 
+    // THIS PART IS IGNORED FOR ASSIGNMENT 3
+    // "exec now supports running the same script"
     // check for duplicate program filenames
-    for(int i = 0; i < num_programs; i++){
-        for(int j = i + 1; j < num_programs; j++){
-            if (strcmp(args[i], args[j]) == 0){
-                printf("Error: Each program must be different.\n");
-                return 1; 
-            }
-        }
-    }
+    // for(int i = 0; i < num_programs; i++){
+    //     for(int j = i + 1; j < num_programs; j++){
+    //         if (strcmp(args[i], args[j]) == 0){
+    //             printf("Error: Each program must be different.\n");
+    //             return 1; 
+    //         }
+    //     }
+    // }
 
     //////////////// FCFS and RR enqueuing ////////////////////
     if(strcmp(policy, "FCFS") == 0 || strcmp(policy, "RR") == 0 || strcmp(policy, "RR30") == 0){
         //load programs and enqueue PCBs
         for (int i=0; i<num_programs; i++){
-            FILE *p = fopen(args[i], "rt"); 
+            // Assignment 3: search to see if this program has already been added to shell memory before allocating memory
+            Program *program = NULL;
+            for (int j=0; j<prog_count; j++){
+                if(strcmp(programs[j].name, args[i]) == 0){
+                    program = &programs[j];
+                    break;
+                }
+            }
 
+            //If program does not already exist in shell memory, load it in
             int code_start = 0;
             int code_len = 0;
-            int load_rc = program_store_script(p, &code_start, &code_len);
-            fclose(p);
+            if (program == NULL){
+                //Create program object first 
+                programs[prog_count].name = strdup(args[i]);
+                programs[prog_count].count = 0;
+                program = &programs[prog_count];
 
-            if (load_rc != 0) {
-                printf("Error: Script memory full\n");
-                return 1;
+
+                FILE *p = fopen(args[i], "rt"); 
+
+                //pass program object pointer to sotre script function
+                int load_rc = program_store_script(p, &code_start, &code_len, program);
+                fclose(p);
+
+                if (load_rc != 0) {
+                    printf("Error: Script memory full\n");
+                    return 1;
+                }
+
+                program->code_start = code_start;
+                program->code_len = code_len;
+                prog_count++;
+            }
+            else{
+                //program already exists in shell memory, PCB points to same memory
+                code_start = program->code_start;
+                code_len = program->code_len;
             }
 
+            //Create PCB
             PCB *pcb = malloc(sizeof(PCB));
             if (!pcb) {
-                program_free(code_start, code_len);
+                if(program->count == 0){
+                    program_free(program);
+                }
                 return 1;
             }
-
             pcb->pid = get_next_pid();
             pcb->code_start = code_start;
             pcb->code_len = code_len;
             pcb->pc = 0;
             pcb->next = NULL;
-
+            pcb->program = program;
+            //Assignment 3: page table logic
+            pcb->num_pages = program->num_pages;
+            for (int i = 0; i < MAX_PAGES; i++) {
+                if (i < program->num_pages) {
+                    pcb->page_table[i] = program->frames[i]; // copy frame number
+                } else {
+                    pcb->page_table[i] = -1; // unused pages
+                }
+            }
             enqueue(pcb);
+            
+            //Increase count of program in memory
+            program->count++;
         }
     }
 
@@ -574,21 +663,50 @@ int exec(char *args[], int args_size) {
         PCB *pcb_list[num_programs];
 
         for (int i = 0; i < num_programs; i++) {
-            FILE *p = fopen(args[i], "rt");
+            // Assignment 3: search to see if this program has already been added to shell memory before allocating memory
+            Program *program = NULL;
+            for (int j=0; j<prog_count; j++){
+                if(strcmp(programs[j].name, args[i]) == 0){
+                    program = &programs[j];
+                    break;
+                }
+            }
 
             int code_start = 0;
             int code_len = 0;
-            int load_rc = program_store_script(p, &code_start, &code_len);
-            fclose(p);
+            // If program not in memory yet:
+            if(program == NULL){
+                //Create program object first 
+                programs[prog_count].name = strdup(args[i]);
+                programs[prog_count].count = 0;
+                program = &programs[prog_count];
 
-            if (load_rc != 0) {
-                printf("Error: Script memory full\n");
-                return 1;
+                FILE *p = fopen(args[i], "rt");
+
+                int load_rc = program_store_script(p, &code_start, &code_len, program);
+                fclose(p);
+
+                if (load_rc != 0) {
+                    printf("Error: Script memory full\n");
+                    return 1;
+                }
+
+                program->code_start = code_start;
+                program->code_len = code_len;
+                prog_count++;
+            }
+            else{
+                //program already exists in shell memory, PCB points to same memory
+                code_start = program->code_start;
+                code_len = program->code_len;
             }
 
+            //Allocate PCB
             PCB *pcb = malloc(sizeof(PCB));
             if (!pcb) {
-                program_free(code_start, code_len);
+                if(program->count == 0){
+                    program_free(program);
+                }
                 return 1;
             }
 
@@ -597,8 +715,21 @@ int exec(char *args[], int args_size) {
             pcb->code_len = code_len;
             pcb->pc = 0;
             pcb->next = NULL;
+            pcb->program = program;
+            //Assignment 3: page table logic
+            pcb->num_pages = program->num_pages;
+            for (int i = 0; i < MAX_PAGES; i++) {
+                if (i < program->num_pages) {
+                    pcb->page_table[i] = program->frames[i]; // copy frame number
+                } else {
+                    pcb->page_table[i] = -1; // unused pages
+                }
+            }
 
             pcb_list[i] = pcb;   // store temporarily
+
+            //Increase count of program in memory
+            program->count++;
         }
 
         //sort
@@ -624,32 +755,73 @@ int exec(char *args[], int args_size) {
         PCB *pcb_list[num_programs];
 
         for (int i = 0; i < num_programs; i++) {
-            FILE *p = fopen(args[i], "rt");
+            // Assignment 3: search to see if this program has already been added to shell memory before allocating memory
+            Program *program = NULL;
+            for (int j=0; j<prog_count; j++){
+                if(strcmp(programs[j].name, args[i]) == 0){
+                    program = &programs[j];
+                    break;
+                }
+            }
 
             int code_start = 0;
             int code_len = 0;
-            int load_rc = program_store_script(p, &code_start, &code_len);
-            fclose(p);
+            // If program is not in memory yet, allocate to shell memory
+            if(program == NULL){
+                //Create program object first 
+                programs[prog_count].name = strdup(args[i]);
+                programs[prog_count].count = 0;
+                program = &programs[prog_count];
 
-            if (load_rc != 0) {
-                printf("Error: Script memory full\n");
-                return 1;
+                FILE *p = fopen(args[i], "rt");
+
+                int load_rc = program_store_script(p, &code_start, &code_len, program);
+                fclose(p);
+
+                if (load_rc != 0) {
+                    printf("Error: Script memory full\n");
+                    return 1;
+                }
+
+                program->code_start = code_start;
+                program->code_len = code_len;
+                prog_count++;
+            }
+            else{
+                //program already exists in shell memory, PCB points to same memory
+                code_start = program->code_start;
+                code_len = program->code_len;
             }
 
+            //Allocate PCB
             PCB *pcb = malloc(sizeof(PCB));
             if (!pcb) {
-                program_free(code_start, code_len);
+                if(program->count == 0){
+                    program_free(program);
+                }
                 return 1;
             }
-
             pcb->pid = get_next_pid();
             pcb->code_start = code_start;
             pcb->code_len = code_len;
             pcb->pc = 0;
             pcb->score= pcb->code_len; // initialize score to code length
             pcb->next = NULL;
+            pcb->program = program;
+            //Assignment 3: page table logic
+            pcb->num_pages = program->num_pages;
+            for (int i = 0; i < MAX_PAGES; i++) {
+                if (i < program->num_pages) {
+                    pcb->page_table[i] = program->frames[i]; // copy frame number
+                } else {
+                    pcb->page_table[i] = -1; // unused pages
+                }
+            }
 
             pcb_list[i] = pcb;   // store temporarily
+
+            //Increase count of program in memory
+            program->count++;
         }
 
         //sort by score this time

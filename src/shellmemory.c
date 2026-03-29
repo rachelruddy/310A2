@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include "shell.h"
 #include "shellmemory.h"
+#include "scheduler.h"
 
 struct memory_struct {
     char *var;
@@ -14,9 +15,15 @@ struct program_line {
     int in_use;
 };
 
-
+// Assignment 3: this is essentially just the variable storage
 struct memory_struct shellmemory[MEM_SIZE];
+//Assignment 3: this stores program code, in frames
 static struct program_line program_memory[PROGRAM_MEM_SIZE];
+
+Program programs[MAX_PROGRAMS];
+int prog_count = 0;
+
+
 
 // Helper functions
 int match(char *model, char *var) {
@@ -42,6 +49,9 @@ void mem_init() {
     for (i = 0; i < PROGRAM_MEM_SIZE; i++) {
         program_memory[i].line = NULL;
         program_memory[i].in_use = 0;
+    }
+    for (int i = 0; i < NUM_FRAMES; i++) {
+        frames[i] = 0;  // all frames free initially
     }
 }
 
@@ -102,7 +112,9 @@ static int program_find_contiguous_free(int count) { // find closes free program
     return -1;
 }
 
-int program_store_script(FILE *p, int *code_start, int *code_len) {
+
+
+int program_store_script(FILE *p, int *code_start, int *code_len, Program *program) {
     char line[MAX_USER_INPUT]; // store where you can
     size_t capacity = 16;
     size_t count = 0;
@@ -136,24 +148,45 @@ int program_store_script(FILE *p, int *code_start, int *code_len) {
         count++;
     }
 
-    int start = program_find_contiguous_free((int)count);
-    if (start < 0) {
-        for (size_t i = 0; i < count; i++) {
-            free(lines[i]);
+    // Assign pages to frames
+    int page_num = 0;
+    int lines_index = 0;
+    while (lines_index < (int)count) {
+        // Find free frame
+        int frame = -1;
+        for (int f = 0; f < NUM_FRAMES; f++) {
+            if (frames[f] == 0) { 
+                frame = f; 
+                break; 
+            }
         }
-        free(lines);
-        return 1;
+        if (frame == -1) {
+            // Out of memory
+            for (size_t i = 0; i < count; i++) free(lines[i]);
+            free(lines);
+            return 1;
+        }
+
+        // Copy lines into frame
+        for (int i = 0; i < FRAME_SIZE && lines_index < (int)count; i++, lines_index++) {
+            int mem_index = frame * FRAME_SIZE + i;
+            program_memory[mem_index].line = lines[lines_index];
+            program_memory[mem_index].in_use = 1;
+        }
+
+        frames[frame] = 1;          // mark frame used
+        program->frames[page_num] = frame; // store in program
+        page_num++;
     }
 
-    for (size_t i = 0; i < count; i++) {
-        program_memory[start + (int)i].line = lines[i];
-        program_memory[start + (int)i].in_use = 1;
-    }
+    // Fill remaining program->frames with -1
+    for (int i = page_num; i < MAX_PAGES; i++) program->frames[i] = -1;
 
-    free(lines);
+    *code_start = 0;  // can keep 0 or remove, code now in frames
+    *code_len = count;
+    program->num_pages = page_num;
 
-    *code_start = start;
-    *code_len = (int)count;
+    free(lines); // lines themselves now in memory
     return 0;
 }
 
@@ -167,20 +200,38 @@ const char *program_get_line(int index) {  // get line at index
     return program_memory[index].line;
 }
 
-void program_free(int code_start, int code_len) {
-    if (code_len <= 0) {
-        return;
+//assignment 3: get line based on virtual address, VA
+const char* program_get_line_VA(PCB *pcb){
+    int virtual_page = pcb->pc / FRAME_SIZE;
+    int page_offset = pcb->pc % FRAME_SIZE;
+
+    // check if page is loaded- HANDLE PAGE FAULTS PART 2, rn just return statement because all pages are loaded
+    if (pcb->page_table[virtual_page] == -1) {
+        return NULL;
     }
 
-    for (int i = 0; i < code_len; i++) {
-        int idx = code_start + i; // calculate the actual index in program memory
-        if (idx < 0 || idx >= PROGRAM_MEM_SIZE) {
-            continue;
-        }
-        if (program_memory[idx].in_use) {
-            free(program_memory[idx].line);
-            program_memory[idx].line = NULL;
-            program_memory[idx].in_use = 0;
+    int frame_number = pcb->page_table[virtual_page];
+    return program_get_line(frame_number * FRAME_SIZE + page_offset);
+}
+
+//Assignment 3: change this so that it frees a program's space in memory based on the frames it takes up
+void program_free(Program *program) {
+    if (!program) return;
+
+    for (int i = 0; i < program->num_pages; i++) {
+        int frame = program->frames[i];
+        if (frame >= 0 && frame < NUM_FRAMES) {
+            // Free lines inside the frame
+            for (int j = 0; j < FRAME_SIZE; j++) {
+                int idx = frame * FRAME_SIZE + j;
+                if (program_memory[idx].in_use) {
+                    free(program_memory[idx].line);
+                    program_memory[idx].line = NULL;
+                    program_memory[idx].in_use = 0;
+                }
+            }
+            // Mark the frame as free
+            frames[frame] = 0;
         }
     }
 }

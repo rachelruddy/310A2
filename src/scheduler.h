@@ -1,6 +1,10 @@
 #ifndef SCHEDULER_H
 #define SCHEDULER_H
 
+#include "shellmemory.h"
+
+#define MAX_PAGES 333
+
 // Define PCB struct
 typedef struct PCB {
   int pid;
@@ -9,6 +13,10 @@ typedef struct PCB {
   int pc;
   int score;
   struct PCB *next;
+  // Assignment 3: Page table addition to PCB
+  int page_table[MAX_PAGES];    //Stores the frame number for each page
+  int num_pages;                //Number of pages in this process' program
+  Program *program;              //reference to the program associated to this process
 } PCB;
 
 //enqueue/dequeue pcb

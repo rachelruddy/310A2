@@ -96,7 +96,7 @@ static void *mt_worker_main(void *arg) {
         int done = 0;
         for (int i = 0; i < quantum; i++) {
             if (pcb->pc < pcb->code_len) {
-                const char *line = program_get_line(pcb->code_start + pcb->pc);
+                const char *line = program_get_line_VA(pcb);
                 if (line) {
                     (void)parseInput((char *)line);
                 }
@@ -115,7 +115,14 @@ static void *mt_worker_main(void *arg) {
         mt_active_workers--;
 
         if (done) {
-            program_free(pcb->code_start, pcb->code_len);
+            // get program associated with this PCB
+            Program *program = pcb->program;
+            if (program) {
+                program->count--;
+                if (program->count == 0) {
+                    program_free(program);  // free all frames
+                }
+            }
             free(pcb);
         } else {
             enqueue_nolock(pcb);
@@ -243,6 +250,7 @@ int scheduler_mt_is_worker_thread(void) {
 }
 // -------------- end MT scheduler skeleton --------------
 
+
 //enqueue a PCB into ready queue ordered by score (ascending)
 static void enqueue_by_score(PCB *pcb){
     pcb->next = NULL;
@@ -328,19 +336,27 @@ void run_scheduler(const char *policy){
     if(strcmp(policy, "FCFS") == 0 || strcmp(policy, "SJF") == 0){
         while ((pcb = dequeue()) != NULL) {
             while (pcb->pc < pcb->code_len) {
-                const char *line = program_get_line(pcb->code_start + pcb->pc);
+                const char *line = program_get_line_VA(pcb);
                 if (line) {
                     (void)parseInput((char *)line);
                 }
                 pcb->pc++;
             }
-            program_free(pcb->code_start, pcb->code_len);
+            //Assignment 3: instead of just freeing memory where pcb's program lived, first check that no other process is using it.
+            Program *program = pcb->program;
+            // If no other process uses this program, free the program code from shell memory.
+            if (program) {
+                program->count--;
+                if (program->count == 0) {
+                    program_free(program);
+                }
+            }
             free(pcb);
         }
     }
     else if (strcmp(policy, "AGING") == 0){
         while ((pcb = dequeue()) != NULL) {
-            const char *line = program_get_line(pcb->code_start + pcb->pc);
+            const char *line = program_get_line_VA(pcb);
             if (line) {
                 (void)parseInput((char *)line);
             }
@@ -349,7 +365,15 @@ void run_scheduler(const char *policy){
             age_ready_queue();
 
             if (pcb->pc >= pcb->code_len) {
-                program_free(pcb->code_start, pcb->code_len);
+                //Assignment 3: instead of just freeing memory where pcb's program lived, first check that no other process is using it.
+                Program *program = pcb->program;
+                // If no other process uses this program, free the program code from shell memory.
+                if (program) {
+                    program->count--;
+                    if (program->count == 0) {
+                        program_free(program);
+                    }
+                }
                 free(pcb);
             } else {
                 enqueue_by_score(pcb);
@@ -364,14 +388,22 @@ void run_scheduler(const char *policy){
             int done = 0;
             for (int i = 0; i < quantum; i++){
                 if(pcb->pc < pcb->code_len){
-                    const char *line = program_get_line(pcb->code_start + pcb->pc);
+                    const char *line = program_get_line_VA(pcb);
                     if (line) {
                         (void)parseInput((char *)line);
                     }
                     pcb->pc++;
                 }
                 else{
-                    program_free(pcb->code_start, pcb->code_len);
+                    //Assignment 3: instead of just freeing memory where pcb's program lived, first check that no other process is using it.
+                    Program *program = pcb->program;
+                    // If no other process uses this program, free the program code from shell memory.
+                    if (program) {
+                        program->count--;
+                        if (program->count == 0) {
+                            program_free(program);
+                        }
+                    }
                     free(pcb);
                     done = 1;
                     break;
@@ -387,4 +419,16 @@ void run_scheduler(const char *policy){
 
     //reset PIDs
     next_pid = 1;
+
+    // After all PCBs have been processed, reset program tracking
+    prog_count = 0;
+    for (int i = 0; i < MAX_PROGRAMS; i++) {
+        if (programs[i].name) {
+            free(programs[i].name);
+            programs[i].name = NULL;
+        }
+        programs[i].code_start = 0;
+        programs[i].code_len = 0;
+        programs[i].count = 0;
+    }
 }
