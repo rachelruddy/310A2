@@ -11,6 +11,7 @@ typedef struct PCB {
   int code_start;
   int code_len;
   int pc;
+  int page_faulted;
   int score;
   struct PCB *next;
   // Assignment 3: Page table addition to PCB
@@ -35,5 +36,7 @@ void scheduler_mt_shutdown(void);
 int scheduler_mt_is_enabled(void);
 void scheduler_mt_request_quit(void);
 int scheduler_mt_is_worker_thread(void);
+int scheduler_is_running(void);
+void invalidate_frame(int frame_start);
 
 #endif

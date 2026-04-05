@@ -193,25 +193,31 @@ static int enqueue_batch_script_process(void) {
     int code_start = 0;
     int code_len = 0;
 
-    // create a temporary Program object for this batch script
-    Program batch_program;
-    batch_program.count = 0;  // no PCBs yet
+    Program *batch_program = malloc(sizeof(Program));
+    if (!batch_program) {
+        fclose(tmp);
+        return 1;
+    }
+    memset(batch_program, 0, sizeof(Program));
+    batch_program->count = 0;
 
 
-    int load_rc = program_store_script(tmp, &code_start, &code_len, &batch_program);
+    int load_rc = program_store(tmp, &code_start, &code_len, batch_program);
     fclose(tmp);
 
     if (load_rc != 0) {
+        free(batch_program);
         printf("Error: Script memory full\n");
         return 1;
     }
 
-    batch_program.code_start = code_start;
-    batch_program.code_len = code_len;
+    batch_program->code_start = code_start;
+    batch_program->code_len = code_len;
 
     PCB *pcb = malloc(sizeof(PCB));
     if (!pcb) {
-        program_free(&batch_program);
+        program_free(batch_program);
+        free(batch_program);
         return 1;
     }
 
@@ -219,14 +225,15 @@ static int enqueue_batch_script_process(void) {
     pcb->code_start = code_start;
     pcb->code_len = code_len;
     pcb->pc = 0;
+    pcb->page_faulted = 0;
     pcb->score = pcb->code_len;
     pcb->next = NULL;
-    pcb->program = &batch_program;
+    pcb->program = batch_program;
     //Assignment 3: page table logic
-    pcb->num_pages = batch_program.num_pages;
+    pcb->num_pages = batch_program->num_pages;
     for (int i = 0; i < MAX_PAGES; i++) {
-        if (i < batch_program.num_pages) {
-            pcb->page_table[i] = batch_program.frames[i]; // copy frame number
+        if (i < batch_program->num_pages) {
+            pcb->page_table[i] = batch_program->frames[i]; // copy frame start index
         } else {
             pcb->page_table[i] = -1; // unused pages
         }
@@ -235,7 +242,7 @@ static int enqueue_batch_script_process(void) {
     enqueue_front(pcb);
 
     // increment count now that PCB points to program
-    batch_program.count = 1;
+    batch_program->count = 1;
 
     return 0;
 }
@@ -434,24 +441,30 @@ int source(char *script) {
     int code_start = 0;
     int code_len = 0;
 
-    //create program object for script
-    Program source_program;
-    source_program.count = 0;       //no pcbs assigned yet
+    Program *source_program = malloc(sizeof(Program));
+    if (!source_program) {
+        fclose(p);
+        return 1;
+    }
+    memset(source_program, 0, sizeof(Program));
+    source_program->count = 0;       //no pcbs assigned yet
 
-    int load_rc = program_store_script(p, &code_start, &code_len, &source_program);
+    int load_rc = program_store(p, &code_start, &code_len, source_program);
     fclose(p);
 
     if (load_rc != 0) {
+        free(source_program);
         printf("Error: Script memory full\n");
         return 1;
     }
 
-    source_program.code_start = code_start;
-    source_program.code_len = code_len;
+    source_program->code_start = code_start;
+    source_program->code_len = code_len;
 
     PCB *pcb = malloc(sizeof(PCB));
     if (!pcb) {
-        program_free(&source_program);
+        program_free(source_program);
+        free(source_program);
         return 1;
     }
 
@@ -459,13 +472,14 @@ int source(char *script) {
     pcb->code_start = code_start;
     pcb->code_len = code_len;
     pcb->pc = 0;
+    pcb->page_faulted = 0;
     pcb->next = NULL;
-    pcb->program = &source_program;
+    pcb->program = source_program;
     //Assignment 3: page table logic
-    pcb->num_pages = source_program.num_pages;
+    pcb->num_pages = source_program->num_pages;
     for (int i = 0; i < MAX_PAGES; i++) {
-        if (i < source_program.num_pages) {
-            pcb->page_table[i] = source_program.frames[i]; // copy frame number
+        if (i < source_program->num_pages) {
+            pcb->page_table[i] = source_program->frames[i]; // copy frame start index
         } else {
             pcb->page_table[i] = -1; // unused pages
         }
@@ -474,7 +488,7 @@ int source(char *script) {
     enqueue(pcb);
 
     // increment count now that PCB points to program
-    source_program.count = 1;
+    source_program->count = 1;
 
     run_scheduler("FCFS");
 
@@ -512,7 +526,6 @@ int run(char *args[], int arg_size) {
 }
 
 int exec(char *args[], int args_size) {
-    int errCode = 0;
     int mt_flag = 0;
     int bg_flag = 0;
 
@@ -536,16 +549,12 @@ int exec(char *args[], int args_size) {
         return 1;
     }
 
-    if (mt_flag) {
-        if (!scheduler_policy_supports_mt(policy)) {
-            printf("MT option only supported with RR or RR30.\n");
-            return 1;
-        }
+    if (mt_flag && !scheduler_policy_supports_mt(policy)) {
+        return badcommand();
+    }
 
-        if (!scheduler_mt_is_enabled() && scheduler_mt_enable() != 0) {
-            printf("Failed to initialize MT scheduler worker threads.\n");
-            return 1;
-        }
+    if (mt_flag && scheduler_mt_enable() != 0) {
+        return 1;
     }
 
     int num_programs = end;
@@ -562,13 +571,6 @@ int exec(char *args[], int args_size) {
             return badcommandFileDoesNotExist();
         }
         fclose(p);
-    }
-
-    if (bg_flag) {
-        errCode = enqueue_batch_script_process();
-        if (errCode != 0) {
-            return errCode;
-        }
     }
 
     // THIS PART IS IGNORED FOR ASSIGNMENT 3
@@ -609,7 +611,7 @@ int exec(char *args[], int args_size) {
                 FILE *p = fopen(args[i], "rt"); 
 
                 //pass program object pointer to sotre script function
-                int load_rc = program_store_script(p, &code_start, &code_len, program);
+                int load_rc = program_store(p, &code_start, &code_len, program);
                 fclose(p);
 
                 if (load_rc != 0) {
@@ -639,6 +641,7 @@ int exec(char *args[], int args_size) {
             pcb->code_start = code_start;
             pcb->code_len = code_len;
             pcb->pc = 0;
+            pcb->page_faulted = 0;
             pcb->next = NULL;
             pcb->program = program;
             //Assignment 3: page table logic
@@ -683,7 +686,7 @@ int exec(char *args[], int args_size) {
 
                 FILE *p = fopen(args[i], "rt");
 
-                int load_rc = program_store_script(p, &code_start, &code_len, program);
+                int load_rc = program_store(p, &code_start, &code_len, program);
                 fclose(p);
 
                 if (load_rc != 0) {
@@ -714,6 +717,7 @@ int exec(char *args[], int args_size) {
             pcb->code_start = code_start;
             pcb->code_len = code_len;
             pcb->pc = 0;
+            pcb->page_faulted = 0;
             pcb->next = NULL;
             pcb->program = program;
             //Assignment 3: page table logic
@@ -775,7 +779,7 @@ int exec(char *args[], int args_size) {
 
                 FILE *p = fopen(args[i], "rt");
 
-                int load_rc = program_store_script(p, &code_start, &code_len, program);
+                int load_rc = program_store(p, &code_start, &code_len, program);
                 fclose(p);
 
                 if (load_rc != 0) {
@@ -805,6 +809,7 @@ int exec(char *args[], int args_size) {
             pcb->code_start = code_start;
             pcb->code_len = code_len;
             pcb->pc = 0;
+            pcb->page_faulted = 0;
             pcb->score= pcb->code_len; // initialize score to code length
             pcb->next = NULL;
             pcb->program = program;
@@ -840,8 +845,16 @@ int exec(char *args[], int args_size) {
             enqueue(pcb_list[i]);
         }
     }
+
+    if (bg_flag) {
+        if (enqueue_batch_script_process() != 0) {
+            return 1;
+        }
+    }
       
-    run_scheduler(policy);
+    if (!scheduler_is_running()) {
+        run_scheduler(policy);
+    }
     return 0;
 }
 

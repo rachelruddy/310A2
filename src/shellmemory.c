@@ -20,6 +20,14 @@ struct memory_struct shellmemory[MEM_SIZE];
 //Assignment 3: this stores program code, in frames
 static struct program_line program_memory[PROGRAM_MEM_SIZE];
 
+// Define the global frame table once here.
+int frames[NUM_FRAMES];
+
+static Program *frame_owner_program[NUM_FRAMES];
+static int frame_owner_page[NUM_FRAMES];
+static unsigned long frame_last_used[NUM_FRAMES];
+static unsigned long lru_tick = 1;
+
 Program programs[MAX_PROGRAMS];
 int prog_count = 0;
 
@@ -52,6 +60,9 @@ void mem_init() {
     }
     for (int i = 0; i < NUM_FRAMES; i++) {
         frames[i] = 0;  // all frames free initially
+        frame_owner_program[i] = NULL;
+        frame_owner_page[i] = -1;
+        frame_last_used[i] = 0;
     }
 }
 
@@ -90,31 +101,114 @@ char *mem_get_value(char *var_in) {
     return NULL;
 }
 
-static int program_find_contiguous_free(int count) { // find closes free program
-    if (count <= 0) {
-        return 0;
-    }
-
-    for (int i = 0; i <= PROGRAM_MEM_SIZE - count; i++) {
-        int ok = 1;
-        for (int j = 0; j < count; j++) {
-            if (program_memory[i + j].in_use) {
-                ok = 0;
-                i = i + j;
-                break;
-            }
-        }
-        if (ok) {
+static int frame_find_free(void) {
+    for (int i = 0; i < NUM_FRAMES; i++) {
+        if (frames[i] == 0) {
             return i;
         }
     }
-
     return -1;
 }
 
+static int frame_select_lru(void) {
+    int victim = -1;
+    unsigned long oldest = 0;
 
+    for (int i = 0; i < NUM_FRAMES; i++) {
+        if (!frames[i]) {
+            continue;
+        }
+        if (victim == -1 || frame_last_used[i] < oldest) {
+            victim = i;
+            oldest = frame_last_used[i];
+        }
+    }
+    return victim;
+}
 
-int program_store_script(FILE *p, int *code_start, int *code_len, Program *program) {
+static void frame_touch(int frame) {
+    if (frame >= 0 && frame < NUM_FRAMES) {
+        frame_last_used[frame] = lru_tick++;
+    }
+}
+
+static int program_loadp(Program *program, int page, int is_page_fault) {
+    if (!program || page < 0 || page >= program->num_pages) {
+        return 1;
+    }
+
+    if (program->frames[page] != -1) {
+        int frame_start = program->frames[page];
+        frame_touch(frame_start / FRAME_SIZE);
+        return 0;
+    }
+
+    int frame = frame_find_free();
+    if (frame == -1) {
+        frame = frame_select_lru();
+        if (frame == -1) {
+            return 1;
+        }
+
+        Program *victim_program = frame_owner_program[frame];
+        int victim_page = frame_owner_page[frame];
+        int victim_frame_start = frame * FRAME_SIZE;
+
+        if (is_page_fault) {
+            printf("Page fault! Victim page contents:\n\n");
+            for (int i = 0; i < FRAME_SIZE; i++) {
+                int idx = frame * FRAME_SIZE + i;
+                if (program_memory[idx].in_use && program_memory[idx].line) {
+                    printf("%s", program_memory[idx].line);
+                }
+            }
+            printf("\nEnd of victim page contents.\n");
+        }
+
+        if (victim_program && victim_page >= 0 && victim_page < victim_program->num_pages) {
+            victim_program->frames[victim_page] = -1;
+        }
+        invalidate_frame(victim_frame_start);
+
+        for (int i = 0; i < FRAME_SIZE; i++) {
+            int idx = frame * FRAME_SIZE + i;
+            if (program_memory[idx].in_use) {
+                free(program_memory[idx].line);
+                program_memory[idx].line = NULL;
+                program_memory[idx].in_use = 0;
+            }
+        }
+    }
+    else if (is_page_fault) {
+        printf("Page fault!\n");
+    }
+
+    int base_line = page * FRAME_SIZE;
+    for (int i = 0; i < FRAME_SIZE; i++) {
+        int idx = frame * FRAME_SIZE + i;
+        int src = base_line + i;
+
+        if (src < program->backing_len && program->backing_store[src]) {
+            program_memory[idx].line = strdup(program->backing_store[src]);
+            if (!program_memory[idx].line) {
+                return 1;
+            }
+            program_memory[idx].in_use = 1;
+        } else {
+            program_memory[idx].line = NULL;
+            program_memory[idx].in_use = 0;
+        }
+    }
+
+    frames[frame] = 1;
+    frame_owner_program[frame] = program;
+    frame_owner_page[frame] = page;
+    program->frames[page] = frame * FRAME_SIZE;
+    frame_touch(frame);
+    return 0;
+}
+
+int program_store(FILE *p, int *code_start, int *code_len, Program *program) {
     char line[MAX_USER_INPUT]; // store where you can
     size_t capacity = 16;
     size_t count = 0;
@@ -148,45 +242,33 @@ int program_store_script(FILE *p, int *code_start, int *code_len, Program *progr
         count++;
     }
 
-    // Assign pages to frames
-    int page_num = 0;
-    int lines_index = 0;
-    while (lines_index < (int)count) {
-        // Find free frame
-        int frame = -1;
-        for (int f = 0; f < NUM_FRAMES; f++) {
-            if (frames[f] == 0) { 
-                frame = f; 
-                break; 
-            }
+    int page_num = (int)((count + FRAME_SIZE - 1) / FRAME_SIZE);
+    if (page_num > MAX_PAGES) {
+        for (size_t i = 0; i < count; i++) {
+            free(lines[i]);
         }
-        if (frame == -1) {
-            // Out of memory
-            for (size_t i = 0; i < count; i++) free(lines[i]);
-            free(lines);
-            return 1;
-        }
-
-        // Copy lines into frame
-        for (int i = 0; i < FRAME_SIZE && lines_index < (int)count; i++, lines_index++) {
-            int mem_index = frame * FRAME_SIZE + i;
-            program_memory[mem_index].line = lines[lines_index];
-            program_memory[mem_index].in_use = 1;
-        }
-
-        frames[frame] = 1;          // mark frame used
-        program->frames[page_num] = frame; // store in program
-        page_num++;
+        free(lines);
+        return 1;
     }
 
-    // Fill remaining program->frames with -1
-    for (int i = page_num; i < MAX_PAGES; i++) program->frames[i] = -1;
+    for (int i = 0; i < MAX_PAGES; i++) {
+        program->frames[i] = -1;
+    }
 
-    *code_start = 0;  // can keep 0 or remove, code now in frames
-    *code_len = count;
+    program->backing_store = lines;
+    program->backing_len = (int)count;
     program->num_pages = page_num;
 
-    free(lines); // lines themselves now in memory
+    int pages_to_preload = (page_num < 2) ? page_num : 2;
+    for (int pg = 0; pg < pages_to_preload; pg++) {
+        if (program_loadp(program, pg, 0) != 0) {
+            return 1;
+        }
+    }
+
+    *code_start = 0;
+    *code_len = (int)count;
+
     return 0;
 }
 
@@ -201,37 +283,65 @@ const char *program_get_line(int index) {  // get line at index
 }
 
 //assignment 3: get line based on virtual address, VA
-const char* program_get_line_VA(PCB *pcb){
-    int virtual_page = pcb->pc / FRAME_SIZE;
-    int page_offset = pcb->pc % FRAME_SIZE;
-
-    // check if page is loaded- HANDLE PAGE FAULTS PART 2, rn just return statement because all pages are loaded
-    if (pcb->page_table[virtual_page] == -1) {
+const char* get_va(PCB *pcb){
+    if (!pcb || !pcb->program || pcb->pc < 0 || pcb->pc >= pcb->code_len) {
         return NULL;
     }
 
-    int frame_number = pcb->page_table[virtual_page];
-    return program_get_line(frame_number * FRAME_SIZE + page_offset);
+    pcb->page_faulted = 0;
+
+    int virtual_page = pcb->pc / FRAME_SIZE;
+    int page_offset = pcb->pc % FRAME_SIZE;
+
+    if (virtual_page < 0 || virtual_page >= pcb->program->num_pages) {
+        return NULL;
+    }
+
+    int frame_start = pcb->program->frames[virtual_page];
+    if (frame_start == -1) {
+        if (program_loadp(pcb->program, virtual_page, 1) != 0) {
+            return NULL;
+        }
+        frame_start = pcb->program->frames[virtual_page];
+        pcb->page_faulted = 1;
+        pcb->page_table[virtual_page] = frame_start;
+        return NULL;
+    }
+
+    pcb->page_table[virtual_page] = frame_start;
+    frame_touch(frame_start / FRAME_SIZE);
+    return program_get_line(frame_start + page_offset);
 }
 
 //Assignment 3: change this so that it frees a program's space in memory based on the frames it takes up
 void program_free(Program *program) {
     if (!program) return;
 
+    for (int i = 0; i < program->backing_len; i++) {
+        free(program->backing_store[i]);
+    }
+    free(program->backing_store);
+    program->backing_store = NULL;
+    program->backing_len = 0;
+
     for (int i = 0; i < program->num_pages; i++) {
-        int frame = program->frames[i];
-        if (frame >= 0 && frame < NUM_FRAMES) {
-            // Free lines inside the frame
-            for (int j = 0; j < FRAME_SIZE; j++) {
-                int idx = frame * FRAME_SIZE + j;
-                if (program_memory[idx].in_use) {
-                    free(program_memory[idx].line);
-                    program_memory[idx].line = NULL;
-                    program_memory[idx].in_use = 0;
+        int frame_start = program->frames[i];
+        if (frame_start >= 0) {
+            int frame = frame_start / FRAME_SIZE;
+            if (frame >= 0 && frame < NUM_FRAMES && frame_owner_program[frame] == program && frame_owner_page[frame] == i) {
+                for (int j = 0; j < FRAME_SIZE; j++) {
+                    int idx = frame * FRAME_SIZE + j;
+                    if (program_memory[idx].in_use) {
+                        free(program_memory[idx].line);
+                        program_memory[idx].line = NULL;
+                        program_memory[idx].in_use = 0;
+                    }
                 }
+                frames[frame] = 0;
+                frame_owner_program[frame] = NULL;
+                frame_owner_page[frame] = -1;
+                frame_last_used[frame] = 0;
             }
-            // Mark the frame as free
-            frames[frame] = 0;
         }
     }
 }

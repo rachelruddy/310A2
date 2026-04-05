@@ -1,0 +1,235 @@
+COMP 310 / ECSE 427
+Assignment 3: Memory Management
+Demand Paging with LRU Replacement
+TA: Mohammad Adnaan
+mohammad.adnaan@mail.mcgill.ca
+March 2026
+Outline
+2
+1. Assignment Overview
+What is A3 and how does it build on A2?
+2. The Three Tasks
+Paging Infrastructure | Demand Paging | LRU Replacement
+3. Key Concepts & Tricky Parts
+Memory layout, page tables, page faults, compile flags
+4. Test Cases & Submission
+How to test, what to submit, grading breakdown
+5. Tips & Common Pitfalls
+Advice from past semesters
+Assignment Overview
+3
+What is A3?
+The final assignment after this, you have
+built a simple simulated OS!
+In A2, programs had to fully fit in shell
+memory. A3 removes this limitation using
+demand paging.
+Programs are split into pages (3 lines each).
+Only needed pages are loaded. Old pages
+are swapped out when memory is full.
+Key Constraints
+• Only RR policy tested (time slice = 2)
+• No multithreading, no background (#)
+• Same program name allowed in exec
+(process sharing)
+• Frame store size always a multiple of
+3
+• Terminated processes do NOT clean
+up their frames
+• Both source and exec must use paging
+What’s New
+• Shell memory split into frame store (code)
++ variable store
+• PCBs have page tables instead of
+contiguous line_base / line_count
+• Scripts copied to backing_store/ directory
+for disk-backed loading
+• Page faults handled with LRU eviction
+when frame store is full
+• Duplicate script names now allowed in
+exec. Compile-time flags set memory sizes.
+What Stayed the Same
+• Scheduling queue logic
+• FCFS / SJF / RR / AGING policies
+• Shell parseInput (semicolons etc.)
+• runSchedule loop: dequeue → run → re-
+enqueue
+• All A1/A2 shell commands: help, quit, set,
+print, echo, my_ls, etc.
+Task 1 : Paging Infrastructure
+4
+Frame Store (code pages)
+Index Content
+0-2 Frame 0 (prog1, page 0)
+3-5 Frame 1 (prog1, page 1)
+6-8 Frame 2 (prog2, page 0)
+9-11 Frame 3 (prog2, page 1)
+12-14 (free)
+15-17 (free)
+Variable Store (set/print)
+Separate memory for shell variables (at least 10
+entries)
+Key Points
+• Each page = 3 lines of code
+• Each frame = 3 contiguous slots in the
+frame store
+• Frame store and variable store are
+separate (or logically partitioned)
+• Sizes set at compile time with -D flags
+(more on this in Task 2)
+• Pages are NOT loaded contiguously —
+page tables handle the mapping
+Address translation:
+page = PC / 3, offset = PC % 3
+physical index = page_table[page] + offset
+Memory Partitioning
+Task 1 : Paging Infrastructure
+5
+Page Tables & Process Sharing
+Page Table Example
+Page # Frame Start Index Status
+0 0 Loaded
+1 6 Loaded
+2 -1 Not loaded
+• Each PCB has its own page table array
+• page_table[i] = frame start index, or -1 if not
+loaded
+• Size = ceil(total_lines / 3)
+Process Sharing
+exec prog1 prog1 RR is now legal!
+When two processes share the same
+script name:
+• They share the same loaded code
+pages in memory
+• Each has its own PCB and PC
+• If one process loads a page, the
+other can use it (no page fault)
+• Page table entries must be kept in
+sync
+• If a shared page is evicted, update
+ALL page tables that reference it
+Task 2 : Demand Paging
+6
+Compilation
+make mysh framesize=X varmemsize=Y
+Use gcc -D FRAME_STORE_SIZE=$(framesize) -D VAR_STORE_SIZE=$(varmemsize) in your Makefile
+Startup message (replaces version string):
+Frame Store Size = 18; Variable Store Size = 10
+Initial Code Loading Rules
+• Only load the first 2 pages of each program at start
+• If program < 3 lines, only 1 page is loaded
+• Remaining pages loaded on demand (page faults)
+• Programs start executing per scheduling policy (RR, time slice = 2)
+Page Fault Handling
+1. Process tries to execute
+instruction from an unloaded page → 2. Process is interrupted and
+placed at back of ready queue → 3. Missing page is loaded from the
+backing file into frame store
+If frame store has free space:
+• Allocate a free frame
+• Print: "Page fault!"
+• Load the page, update page table
+If frame store is FULL:
+• Pick a victim frame (LRU — Task 3)
+• Print victim page contents
+• Evict it, load new page, update ALL page
+tables
+Task 3 : LRU Replacement Policy
+7
+Least Recently Used: evict the frame that was accessed least recently across ALL processes
+Requirements
+• Must be accurate LRU, not an
+approximation
+• Track access times for every frame in the
+frame store
+• Update the timestamp every time a
+frame is accessed (i.e., when an
+instruction from that frame is executed)
+• On eviction, select the frame with the
+smallest (oldest) timestamp
+• A page fault from P1 can evict a page
+from P2
+Implementation Hints
+• Option A: Linked list with move-to-front
+on access (classic approach)
+• Option B: Timestamp counter per frame
+(simpler to implement)
+Whichever you choose, you need a way to:
+• Mark a frame as accessed
+• Find the LRU frame quickly
+• Map frames back to page table
+entries for invalidation
+Remember: When you evict a frame, you must invalidate ALL page table entries (across all
+PCBs) that point to that frame.
+Test Cases
+8
+TC Frame Size Var Size Description
+1 18 10 3 small programs, no page faults
+2 18 10 Variables + semicolons, no page faults
+3 21 10 Page faults with LRU eviction
+4 18 10 Complex: set/print + multiple page fault evictions
+5 6 10 source command with page fault
+How to Run Tests
+cd src
+make clean; make mysh framesize=18 varmemsize=10
+cp ../test-cases/prog* . && ./mysh < ../test-cases/tc1.txt
+Submission Requirements
+9
+Directory Structure
+project-root/
+├── src/
+│ ├── Makefile
+│ └── (source files)
+├── test-cases/
+├── explainer.mp4
+└── README.txt
+Grading (100 pts)
+• 80 pts — Test cases (16 pts each x 5)
+• 20 pts — Code review + explainer
+video
+• Hardcoded outputs = 0 points
+Code must compile with:
+make clean; make mysh
+framesize=X varmemsize=Y
+Must run in batch mode:
+./mysh < testfile.txt
+Explainer Video (2:30 – 3 min)
+• Explain your implementation of section Demand Paging
+• Code must be visible on screen as you walk through it
+• Camera must be ON — You must be visible
+• Cover: thought process, main data structures, overall code logic
+Tips & Common Pitfalls
+10
+✓ Do’s
+• Start with Task 1 : get your A2 tests
+passing with pages before adding
+demand paging
+• Test incrementally: TC1/TC2 first (no
+faults), then TC3 (faults), then TC4/TC5
+• Use your A2 solution as the base
+(recommended) or the official A2
+solution
+• Keep your backing store cleanup reliable
+(rm -rf backing_store)
+• Re-compile between test cases
+(different framesize!)
+• Redownload your submission zip and
+verify it compiles from scratch
+✗ Don’ts / Watch Out
+• Don’t forget to update ALL page tables
+on eviction (shared processes!)
+• Don’t clean up frames when a process
+terminates (spec says don’t)
+• Don’t assume pages load contiguously
+that’s the whole point of page tables
+• Don’t use approximate LRU (e.g., clock
+algorithm) must be accurate
+• Don’t hardcode outputs: automatic
+zero
+• Watch for off-by-one errors in page
+table indexing (PC / 3 vs PC % 3)
+Questions?
+Due: April 7, 2026 at 23:59
+If you get stuck Post on Ed or Come in Office hours!
+TAs: Mohammad Adnaan | Mansi Dhanania | Rahma Nouaji
+Infrastructure: Olivier Michaud

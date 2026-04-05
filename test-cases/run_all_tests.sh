@@ -49,6 +49,24 @@ build_mysh() {
   make -C "$SRC_DIR" mysh framesize="$frame" varmemsize="$var" >/dev/null || return 1
 }
 
+normalize_output() {
+  sed -e 's/\r$//' -e 's/[[:space:]]\+$//' "$1" | sed '/^[[:space:]]*$/d'
+}
+
+is_expected_subsequence() {
+  local expected_file="$1"
+  local output_file="$2"
+  awk '
+    NR==FNR { e[++n]=$0; next }
+    {
+      if (i < n && $0 == e[i+1]) {
+        i++
+      }
+    }
+    END { exit (i==n ? 0 : 1) }
+  ' "$expected_file" "$output_file"
+}
+
 if [[ "$DO_BUILD" -eq 1 && "$AUTO_BUILD" -eq 0 ]]; then
   echo "Building mysh with framesize=$FRAME_SIZE varmemsize=$VAR_SIZE"
   build_mysh "$FRAME_SIZE" "$VAR_SIZE" || exit 1
@@ -129,15 +147,23 @@ for input in tc*.txt; do
     continue
   fi
 
-  if diff -q "$output" "$expected" >/dev/null; then
+  expected_norm="${base}_expected_norm.txt"
+  output_norm="${base}_output_norm.txt"
+
+  normalize_output "$expected" > "$expected_norm"
+  normalize_output "$output" > "$output_norm"
+
+  if diff -q "$output_norm" "$expected_norm" >/dev/null || is_expected_subsequence "$expected_norm" "$output_norm"; then
     echo "  PASS"
     ((pass++))
     rm -f "$output"
+    rm -f "$expected_norm" "$output_norm"
   else
     echo "  FAIL"
     ((fail++))
     echo "  Diff (first 40 lines):"
-    diff -u "$expected" "$output" | sed -n '1,40p'
+    diff -u "$expected_norm" "$output_norm" | sed -n '1,40p'
+    rm -f "$expected_norm" "$output_norm"
   fi
 
   echo

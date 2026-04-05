@@ -18,8 +18,8 @@ static PCB *ready_tail = NULL;
 static const int max_instr = 2;
 
 // ---------------- MT scheduler skeleton ----------------
-static const int mt_worker_count = 2;
-static pthread_t mt_workers[2];
+static const int mt_worker_count = 1;
+static pthread_t mt_workers[1];
 static pthread_mutex_t mt_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t mt_cv = PTHREAD_COND_INITIALIZER;
 static int mt_enabled = 0;
@@ -28,6 +28,38 @@ static int mt_running = 0;
 static int mt_active_workers = 0;
 static int mt_quantum = 2;
 static int mt_quit_requested = 0;
+static int scheduler_running = 0;
+static PCB *mt_current_pcb = NULL;
+
+static const char *fetch_current_line(PCB *pcb) {
+    return program_get_line_VA(pcb);
+}
+
+int scheduler_is_running(void) {
+    return scheduler_running;
+}
+
+void invalidate_frame(int frame_start) {
+    pthread_mutex_lock(&mt_lock);
+    PCB *cur = ready_head;
+    while (cur) {
+        for (int i = 0; i < cur->num_pages; i++) {
+            if (cur->page_table[i] == frame_start) {
+                cur->page_table[i] = -1;
+            }
+        }
+        cur = cur->next;
+    }
+
+    if (mt_current_pcb) {
+        for (int i = 0; i < mt_current_pcb->num_pages; i++) {
+            if (mt_current_pcb->page_table[i] == frame_start) {
+                mt_current_pcb->page_table[i] = -1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&mt_lock);
+}
 
 static int rr_quantum_for_policy(const char *policy) {
     if (strcmp(policy, "RR30") == 0) {
@@ -89,6 +121,7 @@ static void *mt_worker_main(void *arg) {
         if (!pcb) {
             continue;
         }
+        mt_current_pcb = pcb;
         mt_active_workers++;
         int quantum = mt_quantum;
         pthread_mutex_unlock(&mt_lock);
@@ -96,11 +129,16 @@ static void *mt_worker_main(void *arg) {
         int done = 0;
         for (int i = 0; i < quantum; i++) {
             if (pcb->pc < pcb->code_len) {
-                const char *line = program_get_line_VA(pcb);
+                const char *line = fetch_current_line(pcb);
                 if (line) {
                     (void)parseInput((char *)line);
+                    pcb->pc++;
+                } else if (pcb->page_faulted) {
+                    break;
+                } else {
+                    done = 1;
+                    break;
                 }
-                pcb->pc++;
             } else {
                 done = 1;
                 break;
@@ -113,15 +151,15 @@ static void *mt_worker_main(void *arg) {
 
         pthread_mutex_lock(&mt_lock);
         mt_active_workers--;
+        if (mt_current_pcb == pcb) {
+            mt_current_pcb = NULL;
+        }
 
-        if (done) {
+        if (done || pcb->pc >= pcb->code_len) {
             // get program associated with this PCB
             Program *program = pcb->program;
             if (program) {
                 program->count--;
-                if (program->count == 0) {
-                    program_free(program);  // free all frames
-                }
             }
             free(pcb);
         } else {
@@ -321,6 +359,11 @@ int get_next_pid(void){
 
 //run the scheduler
 void run_scheduler(const char *policy){
+    if (scheduler_running) {
+        return;
+    }
+    scheduler_running = 1;
+
     PCB *pcb = NULL;
 
     if (mt_enabled && scheduler_policy_supports_mt(policy)) {
@@ -329,50 +372,63 @@ void run_scheduler(const char *policy){
         mt_running = 1;
         pthread_cond_broadcast(&mt_cv);
         pthread_mutex_unlock(&mt_lock);
+        scheduler_running = 0;
         return;
     }
 
     //FCFS and SJF implementation
     if(strcmp(policy, "FCFS") == 0 || strcmp(policy, "SJF") == 0){
         while ((pcb = dequeue()) != NULL) {
+            int fetch_failed = 0;
             while (pcb->pc < pcb->code_len) {
-                const char *line = program_get_line_VA(pcb);
+                const char *line = fetch_current_line(pcb);
                 if (line) {
                     (void)parseInput((char *)line);
+                    pcb->pc++;
+                } else if (pcb->page_faulted) {
+                    continue;
+                } else {
+                    fetch_failed = 1;
+                    break;
                 }
-                pcb->pc++;
             }
             //Assignment 3: instead of just freeing memory where pcb's program lived, first check that no other process is using it.
             Program *program = pcb->program;
-            // If no other process uses this program, free the program code from shell memory.
             if (program) {
                 program->count--;
-                if (program->count == 0) {
-                    program_free(program);
-                }
             }
             free(pcb);
+            if (fetch_failed) {
+                continue;
+            }
         }
     }
     else if (strcmp(policy, "AGING") == 0){
         while ((pcb = dequeue()) != NULL) {
-            const char *line = program_get_line_VA(pcb);
+            const char *line = fetch_current_line(pcb);
             if (line) {
                 (void)parseInput((char *)line);
+                pcb->pc++;
+            } else if (pcb->page_faulted) {
+                age_ready_queue();
+                enqueue_by_score(pcb);
+                continue;
+            } else {
+                Program *program = pcb->program;
+                if (program) {
+                    program->count--;
+                }
+                free(pcb);
+                continue;
             }
-            pcb->pc++;
 
             age_ready_queue();
 
             if (pcb->pc >= pcb->code_len) {
                 //Assignment 3: instead of just freeing memory where pcb's program lived, first check that no other process is using it.
                 Program *program = pcb->program;
-                // If no other process uses this program, free the program code from shell memory.
                 if (program) {
                     program->count--;
-                    if (program->count == 0) {
-                        program_free(program);
-                    }
                 }
                 free(pcb);
             } else {
@@ -388,26 +444,41 @@ void run_scheduler(const char *policy){
             int done = 0;
             for (int i = 0; i < quantum; i++){
                 if(pcb->pc < pcb->code_len){
-                    const char *line = program_get_line_VA(pcb);
+                    const char *line = fetch_current_line(pcb);
                     if (line) {
                         (void)parseInput((char *)line);
+                        pcb->pc++;
+                    } else if (pcb->page_faulted) {
+                        break;
+                    } else {
+                        Program *program = pcb->program;
+                        if (program) {
+                            program->count--;
+                        }
+                        free(pcb);
+                        done = 1;
+                        break;
                     }
-                    pcb->pc++;
                 }
                 else{
                     //Assignment 3: instead of just freeing memory where pcb's program lived, first check that no other process is using it.
                     Program *program = pcb->program;
-                    // If no other process uses this program, free the program code from shell memory.
                     if (program) {
                         program->count--;
-                        if (program->count == 0) {
-                            program_free(program);
-                        }
                     }
                     free(pcb);
                     done = 1;
                     break;
                 }
+            }
+
+            if (!done && pcb->pc >= pcb->code_len) {
+                Program *program = pcb->program;
+                if (program) {
+                    program->count--;
+                }
+                free(pcb);
+                done = 1;
             }
 
             //enqueue the pcb back to tail of queue if prgrm not done
@@ -419,16 +490,6 @@ void run_scheduler(const char *policy){
 
     //reset PIDs
     next_pid = 1;
+    scheduler_running = 0;
 
-    // After all PCBs have been processed, reset program tracking
-    prog_count = 0;
-    for (int i = 0; i < MAX_PROGRAMS; i++) {
-        if (programs[i].name) {
-            free(programs[i].name);
-            programs[i].name = NULL;
-        }
-        programs[i].code_start = 0;
-        programs[i].code_len = 0;
-        programs[i].count = 0;
-    }
 }
