@@ -32,7 +32,7 @@ static int scheduler_running = 0;
 static PCB *mt_current_pcb = NULL;
 
 static const char *fetch_current_line(PCB *pcb) {
-    return program_get_line_VA(pcb);
+    return get_va(pcb);
 }
 
 int scheduler_is_running(void) {
